@@ -37,18 +37,18 @@ func (t *typeFuncs) push(kind fnKind, i ...int) {
 
 var idseq atomic.Int64
 
+// Dispatcher is the object that represents how events of particular types are
+// routed to registered [Handler] and [Wrapper].
 type Dispatcher struct {
-	l sync.RWMutex
-
-	fns map[int]reflect.Value
-
+	l        sync.RWMutex
+	fns      map[int]reflect.Value
 	ifaces   map[reflect.Type]*typeFuncs
 	concrete map[reflect.Type]*typeFuncs
 }
 
 var globalRouter = new(Dispatcher)
 
-// Register binds a Handler to a particular event by it's event type (E). The
+// Register binds a [Handler] to a particular event by it's event type (E). The
 // registered event type may also be an interface, to allow for capturing
 // multiple types in one handler.
 func Register[E any](handler Handler[E]) {
@@ -61,6 +61,11 @@ func Dispatch[E any](ctx context.Context, event E) error {
 	return Using[E](globalRouter).Dispatch(ctx, event)
 }
 
+// Wrap will allow a [Wrapper] function to be called before any [Handler] of a
+// matching event. The use-case for wrapping tends to be things like
+// observability (logging, metrics, tracing, etc.). Wrapper functions that match
+// a particular [Dispatch] will all be called serially in the order they were
+// setup.
 func Wrap[E any](wrapper Wrapper[E]) {
 	Using[E](globalRouter).Wrap(wrapper)
 }
@@ -69,6 +74,11 @@ type typedDispatch[E any] struct {
 	d *Dispatcher
 }
 
+// Wrapper is a function that will be called before an Handler is called for a
+// particular [Dispatch] call. With each [Dispatch] call, zero or many Wrapper
+// functions might be called, but they will all be guaranteed to be called
+// serially. Once all wrapper functions have invoked their next(), the actual
+// [Handler] functions will be invoked.
 type Wrapper[E any] func(ctx context.Context, event E, next func(context.Context) error) error
 
 func (t *typedDispatch[E]) Wrap(wrapper Wrapper[E]) {
@@ -211,14 +221,17 @@ func (t *typedDispatch[E]) Dispatch(ctx context.Context, event E) error {
 	return top(ctx)
 }
 
-// Using allows an instance of Dispatcher to be used with a specific type. The
+// Using allows an instance of [Dispatcher] to be used with a specific type. The
 // returned value of this is not meant to be "long-lived" or stored anywhere;
 // rather used ephemerally and called as a chain.
 func Using[E any](r *Dispatcher) interface {
+	// Wrap does the equivalent of [Wrap] on an explicit [Dispatcher].
 	Wrap(wrapper Wrapper[E])
+
+	// Register does the equivalent of [Register] on an explicit [Dispatcher].
 	Register(handler Handler[E])
 
-	// Dispatch does this thing
+	// Dispatch does the equivalent of [Dispatch] on an explict [Dispatcher].
 	Dispatch(ctx context.Context, event E) error
 } {
 	return &typedDispatch[E]{d: r}
