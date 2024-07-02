@@ -4,6 +4,11 @@
 // declare events by type and dispatach those events to other code so that other
 // concerns may be maintained in separate areas of the codebase.
 //
+// # Status
+//
+// This package has not been tagged with SemVer tags just yet. It is still
+// experimental and it's API can be changed in potentially breaking ways.
+//
 // # Register/Dispatch events
 //
 // ed uses Go's own type system to dispatch events to the correct event
