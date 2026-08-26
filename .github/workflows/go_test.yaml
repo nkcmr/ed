@@ -4,20 +4,35 @@ on: [push, pull_request]
 
 jobs:
   test:
-    name: Run Go Tests
+    name: Run Go Tests (go ${{ matrix.go-version }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        go-version: ["1.18", "1.19", "1.20", "1.21", "1.22"]
+        # 1.27 is the floor: this module uses generic methods, which are not
+        # accepted by any earlier toolchain. "stable" tracks the latest release.
+        go-version: ["1.27.x", "stable"]
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v2
+        uses: actions/setup-go@v5
         with:
-          go-version: "^1.18"
+          go-version: ${{ matrix.go-version }}
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "these files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
 
       - name: Run tests
-        run: go test -v ./...
+        run: go test -v -race -shuffle=on ./...

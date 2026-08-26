@@ -47,6 +47,24 @@
 //	    return nil
 //	})
 //
+// # Ordering
+//
+// Execution order is deliberately not part of this package's contract, and may
+// change between releases.
+//
+// Handlers matching a single dispatch run concurrently, each on its own
+// goroutine. Wrappers matching a single dispatch all run serially, and all of
+// them are entered before any handler runs, but how they nest relative to one
+// another is unspecified — a wrapper registered against an interface and one
+// registered against a concrete type have no defined relationship, and neither
+// do two wrappers registered against different interfaces.
+//
+// What is guaranteed is only this: every matching wrapper is entered before any
+// matching handler is invoked, every matching handler runs unless a wrapper
+// declines to call its next(), and no wrapper runs concurrently with another.
+// If ordering between two pieces of logic matters, put them in the same handler
+// rather than relying on registration order.
+//
 // # Goals
 //
 // Overall, this package's goal is to mostly be an aid in allowing application

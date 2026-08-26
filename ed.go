@@ -38,7 +38,18 @@ func (t *typeFuncs) push(kind fnKind, i ...int) {
 var idseq atomic.Int64
 
 // Dispatcher is the object that represents how events of particular types are
-// routed to registered [Handler] and [Wrapper].
+// routed to registered [Handler] and [Wrapper]. The zero value is ready to
+// use.
+//
+// A Dispatcher is safe for concurrent use; registrations and dispatches may
+// come from any goroutine. There is one caveat: [Dispatcher.Dispatch] holds a
+// read lock for the whole call, including while handlers and wrappers run. A
+// handler or wrapper must therefore never call [Dispatcher.Register] or
+// [Dispatcher.Wrap] on the Dispatcher that is currently dispatching to it,
+// since that will deadlock. Dispatching a further event from inside a handler
+// relies on recursive read-locking, and can deadlock as well if a registration
+// arrives concurrently. The simplest way to avoid both: finish registering
+// handlers and wrappers before the first event is dispatched.
 type Dispatcher struct {
 	l        sync.RWMutex
 	fns      map[int]reflect.Value
@@ -52,26 +63,27 @@ var globalRouter = new(Dispatcher)
 // registered event type may also be an interface, to allow for capturing
 // multiple types in one handler.
 func Register[E any](handler Handler[E]) {
-	Using[E](globalRouter).Register(handler)
+	globalRouter.Register(handler)
 }
 
 // Dispatch will send the provided event to all registered handlers and
 // wrappers and allow them to return an error if necessary.
+//
+// Events are routed by their dynamic type, so dispatching a value held in an
+// interface variable still reaches handlers registered for the concrete type
+// underneath. For that reason the event must not be a nil interface value:
+// there is no dynamic type to route on, and Dispatch will panic.
 func Dispatch[E any](ctx context.Context, event E) error {
-	return Using[E](globalRouter).Dispatch(ctx, event)
+	return globalRouter.Dispatch(ctx, event)
 }
 
 // Wrap will allow a [Wrapper] function to be called before any [Handler] of a
 // matching event. The use-case for wrapping tends to be things like
 // observability (logging, metrics, tracing, etc.). Wrapper functions that match
-// a particular [Dispatch] will all be called serially in the order they were
-// setup.
+// a particular [Dispatch] will all be called serially, but the order they are
+// called in is not guaranteed and may change between releases.
 func Wrap[E any](wrapper Wrapper[E]) {
-	Using[E](globalRouter).Wrap(wrapper)
-}
-
-type typedDispatch[E any] struct {
-	d *Dispatcher
+	globalRouter.Wrap(wrapper)
 }
 
 // Wrapper is a function that will be called before an Handler is called for a
@@ -79,10 +91,15 @@ type typedDispatch[E any] struct {
 // functions might be called, but they will all be guaranteed to be called
 // serially. Once all wrapper functions have invoked their next(), the actual
 // [Handler] functions will be invoked.
+//
+// The relative order in which matching Wrapper functions are nested is not
+// guaranteed and may change between releases. Do not write a Wrapper that
+// depends on running inside or outside any other particular Wrapper.
 type Wrapper[E any] func(ctx context.Context, event E, next func(context.Context) error) error
 
-func (t *typedDispatch[E]) Wrap(wrapper Wrapper[E]) {
-	t.bindFunc(fnKindWrapper, reflect.ValueOf(wrapper))
+// Wrap does the equivalent of [Wrap] on an explicit [Dispatcher].
+func (d *Dispatcher) Wrap[E any](wrapper Wrapper[E]) {
+	d.bindFunc[E](fnKindWrapper, reflect.ValueOf(wrapper))
 }
 
 func (d *Dispatcher) init() {
@@ -105,23 +122,28 @@ const (
 	fnKindWrapper
 )
 
-func (t *typedDispatch[E]) bindFunc(kind fnKind, fn reflect.Value) {
-	t.d.l.Lock()
-	defer t.d.l.Unlock()
-	t.d.init()
+// Register does the equivalent of [Register] on an explicit [Dispatcher].
+func (d *Dispatcher) Register[E any](handler Handler[E]) {
+	d.bindFunc[E](fnKindHandler, reflect.ValueOf(handler))
+}
+
+func (d *Dispatcher) bindFunc[E any](kind fnKind, fn reflect.Value) {
+	d.l.Lock()
+	defer d.l.Unlock()
+	d.init()
 
 	eventType := reflect.TypeFor[E]()
 	fid := int(idseq.Add(1))
-	t.d.fns[fid] = fn
+	d.fns[fid] = fn
 
 	if eventType.Kind() == reflect.Interface {
-		ifm, ok := t.d.ifaces[eventType]
+		ifm, ok := d.ifaces[eventType]
 		if !ok {
 			ifm = new(typeFuncs)
-			t.d.ifaces[eventType] = ifm
+			d.ifaces[eventType] = ifm
 		}
 		ifm.push(kind, fid)
-		for ct, tf := range t.d.concrete {
+		for ct, tf := range d.concrete {
 			if ct.Implements(eventType) {
 				tf.push(kind, fid)
 			}
@@ -129,11 +151,11 @@ func (t *typedDispatch[E]) bindFunc(kind fnKind, fn reflect.Value) {
 		return
 	}
 
-	ctm, ok := t.d.concrete[eventType]
+	ctm, ok := d.concrete[eventType]
 	if !ok {
 		ctm = new(typeFuncs)
-		t.d.concrete[eventType] = ctm
-		for iface, tf := range t.d.ifaces {
+		d.concrete[eventType] = ctm
+		for iface, tf := range d.ifaces {
 			if eventType.Implements(iface) {
 				ctm.push(fnKindHandler, tf.get(fnKindHandler)...)
 				ctm.push(fnKindWrapper, tf.get(fnKindWrapper)...)
@@ -144,27 +166,31 @@ func (t *typedDispatch[E]) bindFunc(kind fnKind, fn reflect.Value) {
 }
 
 // Handler is a function responsible for handling an event. Returning an error
-// from a Handler function will cause the entire dispatch operation for a
-// Dispatch() to be canceled and will return the error.
+// from a Handler function will cause the [Dispatch] operation that triggered
+// it to return that error. Sibling handlers are not canceled: every matching
+// Handler for a [Dispatch] runs to completion, and if more than one of them
+// fails, one of their errors is returned.
+//
+// All matching Handler functions for a single [Dispatch] are invoked
+// concurrently, each on its own goroutine, and the order they run in is not
+// guaranteed and may change between releases. A Handler must therefore be safe
+// to run alongside every other Handler that matches the same event.
 type Handler[E any] func(ctx context.Context, event E) error
 
-func (t *typedDispatch[E]) Register(handler Handler[E]) {
-	t.bindFunc(fnKindHandler, reflect.ValueOf(handler))
-}
+// Dispatch does the equivalent of [Dispatch] on an explicit [Dispatcher].
+func (d *Dispatcher) Dispatch[E any](ctx context.Context, event E) error {
+	d.l.RLock()
+	defer d.l.RUnlock()
 
-func (t *typedDispatch[E]) Dispatch(ctx context.Context, event E) error {
-	t.d.l.RLock()
-	defer t.d.l.RUnlock()
-
-	if t.d.ifaces == nil && t.d.concrete == nil {
+	if d.ifaces == nil && d.concrete == nil {
 		return nil
 	}
 
 	eventValue := reflect.ValueOf(event)
 	var handlers, wrappers []int
-	tf, ok := t.d.concrete[eventValue.Type()]
+	tf, ok := d.concrete[eventValue.Type()]
 	if !ok {
-		for iface, tf := range t.d.ifaces {
+		for iface, tf := range d.ifaces {
 			// todo, memoize? store in Dispatcher.concrete
 			if eventValue.Type().Implements(iface) {
 				handlers = append(handlers, tf.handlers...)
@@ -189,7 +215,7 @@ func (t *typedDispatch[E]) Dispatch(ctx context.Context, event E) error {
 		for _, handlerID := range handlers {
 			hid := handlerID
 			g.Go(func() error {
-				out := t.d.fns[hid].Call(in)
+				out := d.fns[hid].Call(in)
 				outv := out[0]
 				if outv.IsNil() {
 					return nil
@@ -202,7 +228,7 @@ func (t *typedDispatch[E]) Dispatch(ctx context.Context, event E) error {
 
 	for _, w := range wrappers {
 		thisnext := top
-		wfn := t.d.fns[w]
+		wfn := d.fns[w]
 		top = func(ctx context.Context) error {
 			in := []reflect.Value{
 				reflect.ValueOf(ctx),
@@ -219,20 +245,4 @@ func (t *typedDispatch[E]) Dispatch(ctx context.Context, event E) error {
 	}
 
 	return top(ctx)
-}
-
-// Using allows an instance of [Dispatcher] to be used with a specific type. The
-// returned value of this is not meant to be "long-lived" or stored anywhere;
-// rather used ephemerally and called as a chain.
-func Using[E any](r *Dispatcher) interface {
-	// Wrap does the equivalent of [Wrap] on an explicit [Dispatcher].
-	Wrap(wrapper Wrapper[E])
-
-	// Register does the equivalent of [Register] on an explicit [Dispatcher].
-	Register(handler Handler[E])
-
-	// Dispatch does the equivalent of [Dispatch] on an explict [Dispatcher].
-	Dispatch(ctx context.Context, event E) error
-} {
-	return &typedDispatch[E]{d: r}
 }
