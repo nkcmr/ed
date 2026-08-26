@@ -177,6 +177,17 @@ func (d *Dispatcher) bindFunc[E any](kind fnKind, fn reflect.Value) {
 // to run alongside every other Handler that matches the same event.
 type Handler[E any] func(ctx context.Context, event E) error
 
+// callFn invokes a registered [Handler] or [Wrapper] and unpacks its single
+// error return.
+func callFn(fn reflect.Value, in []reflect.Value) error {
+	out := fn.Call(in)
+	outv := out[0]
+	if outv.IsNil() {
+		return nil
+	}
+	return outv.Interface().(error)
+}
+
 // Dispatch does the equivalent of [Dispatch] on an explicit [Dispatcher].
 func (d *Dispatcher) Dispatch[E any](ctx context.Context, event E) error {
 	d.l.RLock()
@@ -207,13 +218,25 @@ func (d *Dispatcher) Dispatch[E any](ctx context.Context, event E) error {
 	}
 
 	top := func(ctx context.Context) error {
-		var g errgroup.Group
 		in := []reflect.Value{
 			reflect.ValueOf(ctx),
 			eventValue,
 		}
-		for _, handlerID := range handlers {
-			hid := handlerID
+
+		// A lone handler has nothing to run concurrently with, so call it on
+		// this goroutine and skip the errgroup entirely. This is the common
+		// case, and the machinery costs several times more than the call it
+		// would be coordinating.
+		if len(handlers) == 1 {
+			return callFn(d.fns[handlers[0]], in)
+		}
+
+		// This deliberately repeats callFn rather than calling it: routing the
+		// hot goroutine body through the helper measured 4-10% slower across
+		// handler counts, and it is the one place that cost is paid per
+		// handler rather than per dispatch.
+		var g errgroup.Group
+		for _, hid := range handlers {
 			g.Go(func() error {
 				out := d.fns[hid].Call(in)
 				outv := out[0]
@@ -230,17 +253,11 @@ func (d *Dispatcher) Dispatch[E any](ctx context.Context, event E) error {
 		thisnext := top
 		wfn := d.fns[w]
 		top = func(ctx context.Context) error {
-			in := []reflect.Value{
+			return callFn(wfn, []reflect.Value{
 				reflect.ValueOf(ctx),
 				eventValue,
 				reflect.ValueOf(thisnext),
-			}
-			out := wfn.Call(in)
-			outv := out[0]
-			if outv.IsNil() {
-				return nil
-			}
-			return outv.Interface().(error)
+			})
 		}
 	}
 

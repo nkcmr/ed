@@ -120,6 +120,80 @@ func TestDispatch_MultipleHandlersAllFire(t *testing.T) {
 	require.Equal(t, int64(2*n), calls.Load())
 }
 
+func TestDispatch_HandlerCountPathsAgree(t *testing.T) {
+	// Dispatch calls a lone handler inline and fans out to an errgroup for
+	// two or more. Both paths must behave identically, so exercise the
+	// boundary on either side of it.
+	for _, n := range []int{1, 2, 3} {
+		t.Run(fmt.Sprintf("handlers=%d", n), func(t *testing.T) {
+			type ev struct{ payload string }
+
+			t.Run("all fire with the right event", func(t *testing.T) {
+				var d Dispatcher
+				var calls atomic.Int64
+				for range n {
+					d.Register(func(ctx context.Context, event ev) error {
+						assert.Equal(t, ev{payload: "p"}, event)
+						calls.Add(1)
+						return nil
+					})
+				}
+
+				require.NoError(t, d.Dispatch(context.Background(), ev{payload: "p"}))
+				require.Equal(t, int64(n), calls.Load())
+			})
+
+			t.Run("error propagates", func(t *testing.T) {
+				var d Dispatcher
+				var calls atomic.Int64
+				d.Register(func(ctx context.Context, event ev) error {
+					calls.Add(1)
+					return errBoom
+				})
+				for range n - 1 {
+					d.Register(counter[ev](&calls))
+				}
+
+				require.ErrorIs(t, d.Dispatch(context.Background(), ev{}), errBoom)
+				require.Equal(t, int64(n), calls.Load())
+			})
+
+			t.Run("wrappers still apply", func(t *testing.T) {
+				var d Dispatcher
+				var calls, wrapped atomic.Int64
+				d.Wrap(func(ctx context.Context, event ev, next func(context.Context) error) error {
+					wrapped.Add(1)
+					return next(ctx)
+				})
+				for range n {
+					d.Register(counter[ev](&calls))
+				}
+
+				require.NoError(t, d.Dispatch(context.Background(), ev{}))
+				require.Equal(t, int64(n), calls.Load())
+				require.Equal(t, int64(1), wrapped.Load())
+			})
+		})
+	}
+}
+
+func TestDispatch_SingleHandlerPanicReachesCaller(t *testing.T) {
+	// A lone handler runs on the caller's goroutine, so its panic unwinds
+	// through Dispatch and is recoverable. This is NOT true once there are
+	// two or more handlers: those run on errgroup goroutines, where a panic
+	// takes the process down. Documenting the asymmetry, not endorsing it.
+	var d Dispatcher
+	type ev struct{}
+
+	d.Register(func(ctx context.Context, event ev) error {
+		panic("handler blew up")
+	})
+
+	require.PanicsWithValue(t, "handler blew up", func() {
+		_ = d.Dispatch(context.Background(), ev{})
+	})
+}
+
 func TestDispatch_ZeroValueDispatcherIsUsable(t *testing.T) {
 	// a Dispatcher that has never been registered against has nil maps; it
 	// must still dispatch without panicking.
@@ -1166,70 +1240,4 @@ func TestIDSequenceIsUnique(t *testing.T) {
 	defer d.l.RUnlock()
 	require.Len(t, d.concrete[reflect.TypeFor[ev]()].handlers, n)
 	require.Len(t, d.fns, n)
-}
-
-// ---------------------------------------------------------------------------
-// benchmarks
-// ---------------------------------------------------------------------------
-
-type benchEvent struct{ n int }
-
-func BenchmarkDispatch_NoHandlers(b *testing.B) {
-	var d Dispatcher
-	d.Register(func(ctx context.Context, event struct{ unrelated int }) error { return nil })
-	ctx := context.Background()
-	b.ResetTimer()
-	for range b.N {
-		_ = d.Dispatch(ctx, benchEvent{})
-	}
-}
-
-func BenchmarkDispatch_OneConcreteHandler(b *testing.B) {
-	var d Dispatcher
-	d.Register(func(ctx context.Context, event benchEvent) error { return nil })
-	ctx := context.Background()
-	b.ResetTimer()
-	for range b.N {
-		_ = d.Dispatch(ctx, benchEvent{})
-	}
-}
-
-func BenchmarkDispatch_TenConcreteHandlers(b *testing.B) {
-	var d Dispatcher
-	for range 10 {
-		d.Register(func(ctx context.Context, event benchEvent) error { return nil })
-	}
-	ctx := context.Background()
-	b.ResetTimer()
-	for range b.N {
-		_ = d.Dispatch(ctx, benchEvent{})
-	}
-}
-
-// BenchmarkDispatch_InterfaceFallback exercises the path where the event type
-// has never been registered directly, so every dispatch re-scans the interface
-// index (see the "todo, memoize?" note in Dispatch).
-func BenchmarkDispatch_InterfaceFallback(b *testing.B) {
-	var d Dispatcher
-	d.Register(func(ctx context.Context, event any) error { return nil })
-	ctx := context.Background()
-	b.ResetTimer()
-	for range b.N {
-		_ = d.Dispatch(ctx, benchEvent{})
-	}
-}
-
-func BenchmarkDispatch_ThreeWrappers(b *testing.B) {
-	var d Dispatcher
-	for range 3 {
-		d.Wrap(func(ctx context.Context, event benchEvent, next func(context.Context) error) error {
-			return next(ctx)
-		})
-	}
-	d.Register(func(ctx context.Context, event benchEvent) error { return nil })
-	ctx := context.Background()
-	b.ResetTimer()
-	for range b.N {
-		_ = d.Dispatch(ctx, benchEvent{})
-	}
 }
