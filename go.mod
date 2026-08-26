@@ -2,6 +2,10 @@ module code.nkcmr.net/ed
 
 go 1.27.0
 
+retract (
+	v0.1.0 // published with misconfigured go redirector; proxy/sumdb messed up
+)
+
 require (
 	github.com/stretchr/testify v1.9.0
 	golang.org/x/sync v0.7.0
